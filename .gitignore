@@ -1,0 +1,33 @@
+# Built-in Gradle & Android build directories
+.gradle/
+**/build/
+**/.kotlin/
+
+# Android Studio / IntelliJ / Eclipse / VSCode
+.idea/
+*.iml
+.vscode/
+*.ipr
+*.iws
+
+# Local configuration
+local.properties
+
+# Log files
+*.log
+
+# Android Keystores & release artifacts
+*.apk
+*.aab
+*.ap_
+*.dex
+*.keystore
+*.jks
+
+# Profiling & captures
+captures/
+replay/
+
+# OS-generated files
+.DS_Store
+Thumbs.db
