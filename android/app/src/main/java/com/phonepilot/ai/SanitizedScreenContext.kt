@@ -41,7 +41,8 @@ data class SanitizedScreenContext(
 
             val sanitizedList = mutableListOf<SanitizedElement>()
 
-            for (el in snapshot.interactiveElements) {
+            val visibleCandidates = snapshot.allElements.filter { it.isVisible && (it.isInteractive || it.hasReadableContent) }
+            for (el in visibleCandidates) {
                 // Strictly exclude or redact password fields
                 if (el.isPassword) {
                     continue
