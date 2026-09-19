@@ -5,6 +5,7 @@ import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import com.phonepilot.accessibility.NodeParser
 import com.phonepilot.accessibility.ScreenObserver
+import com.phonepilot.action.ActionEngine
 import com.phonepilot.controller.AndroidController
 import com.phonepilot.model.ScreenSnapshot
 import java.lang.ref.WeakReference
@@ -34,6 +35,13 @@ class PhonePilotAccessibilityService : AccessibilityService() {
             private set
 
         /**
+         * Active ActionEngine instance while the service is running.
+         */
+        @Volatile
+        var actionEngine: ActionEngine? = null
+            private set
+
+        /**
          * Whether the service is currently connected and running.
          */
         val isRunning: Boolean
@@ -52,6 +60,7 @@ class PhonePilotAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         serviceRef = WeakReference(this)
         controller = AndroidController(this)
+        actionEngine = ActionEngine.create(screenObserver, { controller }, this)
         Log.i(TAG, "AccessibilityService connected")
 
         // Perform initial capture of active window
@@ -98,6 +107,7 @@ class PhonePilotAccessibilityService : AccessibilityService() {
         Log.i(TAG, "AccessibilityService destroyed")
         serviceRef = null
         controller = null
+        actionEngine = null
         screenObserver.clear()
         lastObservedPackage = null
     }
