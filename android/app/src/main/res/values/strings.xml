@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">PhonePilot</string>
+    <string name="accessibility_service_description">Allows PhonePilot to observe and interact with the Android user interface.</string>
+</resources>
