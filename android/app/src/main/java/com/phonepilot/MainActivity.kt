@@ -1,73 +1,83 @@
 package com.phonepilot
 
+import android.Manifest
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.text.InputType
 import android.view.View
+import android.view.inputmethod.InputMethodManager
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import com.phonepilot.action.ActionEngine
 import com.phonepilot.action.ActionResult
-import com.phonepilot.action.ElementTarget
-import com.phonepilot.action.PhonePilotAction
-import com.phonepilot.action.ScrollDirection
-import com.phonepilot.action.ValidationResult
-import com.phonepilot.agent.LocalRuleAgentPlanner
+import com.phonepilot.agent.LlmAgentPlanner
 import com.phonepilot.agent.PhonePilotAgent
 import com.phonepilot.agent.StepRecord
 import com.phonepilot.agent.TaskState
-import com.phonepilot.ai.AiCommandParser
-import com.phonepilot.ai.AppPackageResolver
-import com.phonepilot.ai.LocalCommandParser
-import com.phonepilot.ai.ParseResult
-import com.phonepilot.ai.SanitizedScreenContext
-import com.phonepilot.model.ScreenSnapshot
-import com.phonepilot.model.UiElement
+import com.phonepilot.ai.LlmProvider
 import com.phonepilot.service.PhonePilotAccessibilityService
+import com.phonepilot.voice.VoiceManager
 
+/**
+ * Clean, production-ready AI console for PhonePilot.
+ * Powered purely by online LLM planning and hands-free voice interaction.
+ */
 class MainActivity : Activity() {
 
-    private lateinit var statusBadge: TextView
-    private lateinit var statusDescription: TextView
-    private lateinit var settingsButton: Button
-    private lateinit var liveInfoContainer: LinearLayout
-    private lateinit var livePackageText: TextView
-    private lateinit var liveElementsText: TextView
-    private lateinit var liveDetailsText: TextView
+    companion object {
+        private const val PREFS_NAME = "phonepilot_prefs"
+        private const val KEY_API_KEY = "api_key"
+        private const val KEY_PROVIDER = "provider"
+        private const val KEY_MODEL = "model"
+        private const val KEY_TTS_ENABLED = "tts_enabled"
+        private const val KEY_HANDS_FREE_ENABLED = "hands_free_enabled"
+        private const val REQ_CODE_MIC = 101
+        private const val REQ_CODE_HANDS_FREE = 102
+    }
 
-    // Phase 4 Autonomous Agent Console UI
+    private lateinit var prefs: SharedPreferences
+    private lateinit var voiceManager: VoiceManager
+
+    // UI - Status
+    private lateinit var statusBadge: TextView
+    private lateinit var settingsButton: Button
+
+    // UI - AI Configuration
+    private lateinit var providerToggleBtn: Button
+    private lateinit var modelInput: EditText
+    private lateinit var apiKeyInput: EditText
+    private lateinit var saveKeyBtn: Button
+    private lateinit var keyStatusText: TextView
+
+    // UI - Autonomous Voice & Agent Console
     private lateinit var agentGoalInput: EditText
+    private lateinit var micButton: Button
+    private lateinit var ttsCheckbox: CheckBox
+    private lateinit var handsFreeCheckbox: CheckBox
     private lateinit var startAgentButton: Button
     private lateinit var cancelAgentButton: Button
     private lateinit var agentStateBadge: TextView
     private lateinit var agentStatusView: TextView
     private lateinit var agentHistoryView: TextView
 
-    // AI Command Console UI (Phase 3.1)
-    private lateinit var commandInput: EditText
-    private lateinit var aiResultView: TextView
-
-    // Phase 2 Action Console UI
-    private lateinit var actionResultView: TextView
-
-    private var unsubscribeScreenObserver: (() -> Unit)? = null
-
-    // Offline-first AI parser & package resolver
-    private lateinit var packageResolver: AppPackageResolver
-    private lateinit var aiParser: AiCommandParser
-
-    // Autonomous agent orchestrator
+    // Core AI Agent
+    private lateinit var llmPlanner: LlmAgentPlanner
     private lateinit var agent: PhonePilotAgent
 
-    // ActionEngine instance via service or explicit construction
     private val actionEngine: ActionEngine
         get() = PhonePilotAccessibilityService.actionEngine
             ?: ActionEngine.create(
@@ -78,18 +88,57 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        packageResolver = AppPackageResolver(this)
-        aiParser = LocalCommandParser(packageResolver)
+        prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        voiceManager = VoiceManager(this)
 
-        val localPlanner = LocalRuleAgentPlanner(packageResolver)
+        // Load saved provider and API key
+        val savedProviderName = prefs.getString(KEY_PROVIDER, LlmProvider.GEMINI.name) ?: LlmProvider.GEMINI.name
+        val savedProvider = try { LlmProvider.valueOf(savedProviderName) } catch (_: Exception) { LlmProvider.GEMINI }
+        var savedModel = prefs.getString(KEY_MODEL, savedProvider.defaultModel) ?: savedProvider.defaultModel
+        if (savedModel.contains("gemini-3.", ignoreCase = true)) {
+            savedModel = "gemini-3.6-flash"
+            prefs.edit().putString(KEY_MODEL, savedModel).apply()
+        }
+        val savedApiKey = prefs.getString(KEY_API_KEY, "") ?: ""
+
+        // Pure online LLM planner
+        llmPlanner = LlmAgentPlanner(
+            provider = savedProvider,
+            apiKey = savedApiKey.ifBlank { null },
+            model = savedModel
+        )
+
         agent = PhonePilotAgent(
             actionEngine = actionEngine,
-            planner = localPlanner,
+            planner = llmPlanner,
             screenSnapshotProvider = {
                 PhonePilotAccessibilityService.instance?.captureCurrentScreen("agent_loop")
                     ?: PhonePilotAccessibilityService.screenObserver.getCurrentScreen()
             }
         )
+
+        // Wire hands-free wake word callback
+        com.phonepilot.service.PilotService.onWakeWordDetected = { keyword ->
+            runOnUiThread {
+                agentStatusView.text = "★ Wake Word Detected: '$keyword'!\nReady for voice command (Deliverable 3)"
+                Toast.makeText(this, "★ 'Hey Pilot' detected!", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        // Wire hardware volume down shortcut
+        PhonePilotAccessibilityService.onHardwareVoiceTrigger = {
+            runOnUiThread {
+                Toast.makeText(this, "Volume button triggered voice", Toast.LENGTH_SHORT).show()
+                startVoiceListening()
+            }
+        }
+
+        val autoStart = intent?.getBooleanExtra("start_hands_free", false) == true
+        if ((autoStart || prefs.getBoolean(KEY_HANDS_FREE_ENABLED, false)) &&
+            checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            prefs.edit().putBoolean(KEY_HANDS_FREE_ENABLED, true).apply()
+            com.phonepilot.service.PilotService.start(this)
+        }
 
         val root = createLayout()
         setContentView(root)
@@ -98,20 +147,14 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         updateServiceStatus()
-
-        // Subscribe to live screen observation updates
-        unsubscribeScreenObserver?.invoke()
-        unsubscribeScreenObserver = PhonePilotAccessibilityService.screenObserver.addListener { snapshot ->
-            runOnUiThread {
-                updateLiveObservation(snapshot)
-            }
+        if (::handsFreeCheckbox.isInitialized) {
+            handsFreeCheckbox.isChecked = com.phonepilot.service.PilotService.isRunning
         }
     }
 
-    override fun onPause() {
-        super.onPause()
-        unsubscribeScreenObserver?.invoke()
-        unsubscribeScreenObserver = null
+    override fun onDestroy() {
+        super.onDestroy()
+        voiceManager.destroy()
     }
 
     private fun updateServiceStatus() {
@@ -120,40 +163,30 @@ class MainActivity : Activity() {
         if (isEnabled) {
             statusBadge.text = "● ACCESSIBILITY SERVICE ACTIVE"
             statusBadge.setTextColor(Color.parseColor("#4CAF50"))
-            statusBadge.background = createRoundedDrawable(Color.parseColor("#1B5E20"), cornerRadius = 16f)
-
-            statusDescription.text = "PhonePilot is actively observing UI events and ready for autonomous agent execution."
-            settingsButton.text = "Accessibility Settings"
-            liveInfoContainer.visibility = View.VISIBLE
+            statusBadge.background = createRoundedDrawable(Color.parseColor("#1B5E20"), cornerRadius = 14f)
+            settingsButton.visibility = View.GONE
         } else {
-            statusBadge.text = "○ ACCESSIBILITY SERVICE NOT ENABLED"
+            statusBadge.text = "○ ACCESSIBILITY PERMISSION REQUIRED"
             statusBadge.setTextColor(Color.parseColor("#FFA000"))
-            statusBadge.background = createRoundedDrawable(Color.parseColor("#4E342E"), cornerRadius = 16f)
-
-            statusDescription.text = "To enable observation, action execution, and autonomous agent control, please grant PhonePilot accessibility permissions in Android Settings."
-            settingsButton.text = "Enable in Accessibility Settings"
-            liveInfoContainer.visibility = View.GONE
+            statusBadge.background = createRoundedDrawable(Color.parseColor("#4E342E"), cornerRadius = 14f)
+            settingsButton.visibility = View.VISIBLE
         }
-    }
-
-    private fun updateLiveObservation(snapshot: ScreenSnapshot) {
-        livePackageText.text = "Active App: ${snapshot.packageName}"
-        liveElementsText.text = "Detected Elements: ${snapshot.interactiveElements.size} interactive, ${snapshot.readableElements.size} readable"
-
-        val preview = snapshot.interactiveElements.take(5).joinToString("\n") { el ->
-            val desc = el.text ?: el.contentDescription ?: el.resourceId?.substringAfter(":id/") ?: el.className?.substringAfterLast('.')
-            "• [$desc] at (${el.centerX}, ${el.centerY})"
-        }
-        liveDetailsText.text = if (preview.isNotEmpty()) "Sample interactive elements:\n$preview" else "No interactive elements in view"
     }
 
     private fun startAgentTask(goal: String) {
         val trimmed = goal.trim()
         if (trimmed.isEmpty()) return
 
-        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? android.view.inputmethod.InputMethodManager
-        currentFocus?.let { view ->
-            imm?.hideSoftInputFromWindow(view.windowToken, 0)
+        if (llmPlanner.apiKey.isNullOrBlank()) {
+            Toast.makeText(this, "Please enter your AI API key first", Toast.LENGTH_LONG).show()
+            apiKeyInput.requestFocus()
+            return
+        }
+
+        hideKeyboard()
+
+        if (ttsCheckbox.isChecked) {
+            voiceManager.speak("Starting goal: $trimmed")
         }
 
         agent.startTask(trimmed) { state ->
@@ -167,7 +200,7 @@ class MainActivity : Activity() {
                 agentStateBadge.text = "● IDLE"
                 agentStateBadge.setTextColor(Color.parseColor("#90A4AE"))
                 agentStateBadge.background = createRoundedDrawable(Color.parseColor("#37474F"), cornerRadius = 12f)
-                agentStatusView.text = "Ready to accept autonomous multi-step goals"
+                agentStatusView.text = "Ready for voice or text goal"
                 agentStatusView.setTextColor(Color.parseColor("#90A4AE"))
                 startAgentButton.isEnabled = true
                 cancelAgentButton.isEnabled = false
@@ -186,6 +219,11 @@ class MainActivity : Activity() {
                 cancelAgentButton.isEnabled = true
                 startAgentButton.alpha = 0.5f
                 cancelAgentButton.alpha = 1.0f
+
+                if (ttsCheckbox.isChecked) {
+                    val spoken = state.lastAction?.let { it::class.simpleName } ?: "Thinking"
+                    voiceManager.speak(spoken.toString())
+                }
             }
 
             is TaskState.Success -> {
@@ -199,19 +237,27 @@ class MainActivity : Activity() {
                 startAgentButton.alpha = 1.0f
                 cancelAgentButton.alpha = 0.5f
                 renderAgentHistory(state.history)
+
+                if (ttsCheckbox.isChecked) {
+                    voiceManager.speak("Goal completed in ${state.totalSteps} steps.")
+                }
             }
 
             is TaskState.Failed -> {
                 agentStateBadge.text = "✖ FAILED (at step ${state.failedAtStep})"
                 agentStateBadge.setTextColor(Color.parseColor("#E57373"))
                 agentStateBadge.background = createRoundedDrawable(Color.parseColor("#B71C1C"), cornerRadius = 12f)
-                agentStatusView.text = "Failure Reason: ${state.reason}"
+                agentStatusView.text = "Error: ${state.reason}"
                 agentStatusView.setTextColor(Color.parseColor("#E57373"))
                 startAgentButton.isEnabled = true
                 cancelAgentButton.isEnabled = false
                 startAgentButton.alpha = 1.0f
                 cancelAgentButton.alpha = 0.5f
                 renderAgentHistory(state.history)
+
+                if (ttsCheckbox.isChecked) {
+                    voiceManager.speak("Goal failed: ${state.reason}")
+                }
             }
 
             is TaskState.Cancelled -> {
@@ -225,6 +271,10 @@ class MainActivity : Activity() {
                 startAgentButton.alpha = 1.0f
                 cancelAgentButton.alpha = 0.5f
                 renderAgentHistory(state.history)
+
+                if (ttsCheckbox.isChecked) {
+                    voiceManager.speak("Task cancelled.")
+                }
             }
         }
     }
@@ -241,7 +291,7 @@ class MainActivity : Activity() {
                 val resIcon = if (step.actionResult is ActionResult.Success) "✔" else "✖"
                 appendLine("Step ${step.stepNumber}: ${step.action::class.simpleName} $resIcon")
                 appendLine("  • Reason: ${step.reasoning}")
-                appendLine("  • Package: ${step.packageNameBefore ?: "unknown"} ➔ ${step.packageNameAfter ?: "unknown"}")
+                appendLine("  • App: ${step.packageNameBefore ?: "unknown"} ➔ ${step.packageNameAfter ?: "unknown"}")
                 if (step.actionResult is ActionResult.Failure) {
                     appendLine("  • Error: ${(step.actionResult as ActionResult.Failure).reason}")
                 }
@@ -250,71 +300,142 @@ class MainActivity : Activity() {
         agentHistoryView.text = text
     }
 
-    private fun runAiCommand(command: String) {
-        val trimmed = command.trim()
-        if (trimmed.isEmpty()) return
+    private fun startVoiceListening() {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQ_CODE_MIC)
+            return
+        }
 
-        aiResultView.text = "Parsing: \"$trimmed\"..."
-        aiResultView.setTextColor(Color.parseColor("#FFD54F"))
+        micButton.text = "🔴 Listening..."
+        micButton.background = createRoundedDrawable(Color.parseColor("#D50000"), cornerRadius = 14f)
 
-        Thread {
-            val freshSnapshot = PhonePilotAccessibilityService.instance?.captureCurrentScreen("ai_command")
-                ?: PhonePilotAccessibilityService.screenObserver.getCurrentScreen()
-            val sanitizedContext = SanitizedScreenContext.from(freshSnapshot)
-
-            val parseResult = aiParser.parse(trimmed, sanitizedContext)
-
-            when (parseResult) {
-                is ParseResult.Failure -> {
-                    runOnUiThread {
-                        aiResultView.setTextColor(Color.parseColor("#E57373"))
-                        aiResultView.text = "AI Parse Error: ${parseResult.reason}"
-                    }
+        voiceManager.startListening(
+            onResult = { transcribedText ->
+                runOnUiThread {
+                    micButton.text = "🎙 Voice"
+                    micButton.background = createRoundedDrawable(Color.parseColor("#7C4DFF"), cornerRadius = 14f)
+                    agentGoalInput.setText(transcribedText)
+                    Toast.makeText(this, "Heard: \"$transcribedText\"", Toast.LENGTH_SHORT).show()
+                    startAgentTask(transcribedText)
                 }
-                is ParseResult.Success -> {
-                    val action = parseResult.action
-                    runOnUiThread {
-                        aiResultView.setTextColor(Color.parseColor("#80D8FF"))
-                        aiResultView.text = "Parsed: ${action::class.simpleName}\nExecuting through ActionEngine..."
-                    }
-
-                    val actionResult = actionEngine.execute(action)
-                    runOnUiThread {
-                        when (actionResult) {
-                            is ActionResult.Success -> {
-                                aiResultView.setTextColor(Color.parseColor("#81C784"))
-                                aiResultView.text = "AI Action: ${action::class.simpleName}\n$actionResult"
-                            }
-                            is ActionResult.Failure -> {
-                                aiResultView.setTextColor(Color.parseColor("#E57373"))
-                                aiResultView.text = "AI Action: ${action::class.simpleName}\n$actionResult"
-                            }
-                        }
-                    }
+            },
+            onError = { error ->
+                runOnUiThread {
+                    micButton.text = "🎙 Voice"
+                    micButton.background = createRoundedDrawable(Color.parseColor("#7C4DFF"), cornerRadius = 14f)
+                    Toast.makeText(this, error, Toast.LENGTH_SHORT).show()
                 }
             }
-        }.start()
+        )
     }
 
-    private fun runAction(name: String, block: () -> ActionResult) {
-        actionResultView.text = "Executing $name..."
-        actionResultView.setTextColor(Color.parseColor("#FFD54F"))
-
-        Thread {
-            val result = block()
-            runOnUiThread {
-                when (result) {
-                    is ActionResult.Success -> {
-                        actionResultView.setTextColor(Color.parseColor("#81C784"))
-                        actionResultView.text = result.toString()
-                    }
-                    is ActionResult.Failure -> {
-                        actionResultView.setTextColor(Color.parseColor("#E57373"))
-                        actionResultView.text = result.toString()
-                    }
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+        when (requestCode) {
+            REQ_CODE_MIC -> {
+                if (granted) startVoiceListening()
+                else Toast.makeText(this, "Microphone permission is required for voice input", Toast.LENGTH_LONG).show()
+            }
+            REQ_CODE_HANDS_FREE -> {
+                if (granted) {
+                    toggleHandsFree(true)
+                } else {
+                    handsFreeCheckbox.isChecked = false
+                    Toast.makeText(this, "Microphone permission is required for hands-free wake", Toast.LENGTH_LONG).show()
                 }
             }
-        }.start()
+        }
+    }
+
+    private fun toggleHandsFree(enable: Boolean) {
+        if (enable) {
+            val permsNeeded = mutableListOf<String>()
+            if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                permsNeeded.add(Manifest.permission.RECORD_AUDIO)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                    permsNeeded.add(Manifest.permission.POST_NOTIFICATIONS)
+                }
+            }
+
+            if (permsNeeded.isNotEmpty()) {
+                requestPermissions(permsNeeded.toTypedArray(), REQ_CODE_HANDS_FREE)
+                return
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
+                Toast.makeText(this, "Please allow 'Display over other apps' for the floating bubble", Toast.LENGTH_LONG).show()
+                val overlayIntent = Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    android.net.Uri.parse("package:$packageName")
+                )
+                startActivity(overlayIntent)
+            }
+
+            com.phonepilot.service.PilotService.start(this)
+            prefs.edit().putBoolean(KEY_HANDS_FREE_ENABLED, true).apply()
+            handsFreeCheckbox.isChecked = true
+            Toast.makeText(this, "🛸 Floating Bubble Active! (Tap: 1-Shot, Hold: Always-Mic)", Toast.LENGTH_SHORT).show()
+        } else {
+            com.phonepilot.service.PilotService.stop(this)
+            prefs.edit().putBoolean(KEY_HANDS_FREE_ENABLED, false).apply()
+            handsFreeCheckbox.isChecked = false
+            Toast.makeText(this, "Floating Bubble Dismissed", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun saveApiConfig() {
+        val newKey = apiKeyInput.text.toString().trim()
+        val newModel = modelInput.text.toString().trim()
+        val currentProvider = llmPlanner.provider
+
+        prefs.edit().apply {
+            putString(KEY_API_KEY, newKey)
+            putString(KEY_PROVIDER, currentProvider.name)
+            putString(KEY_MODEL, newModel.ifBlank { currentProvider.defaultModel })
+            apply()
+        }
+
+        llmPlanner.apiKey = newKey.ifBlank { null }
+        llmPlanner.model = newModel.ifBlank { currentProvider.defaultModel }
+
+        hideKeyboard()
+        updateKeyStatusText()
+        Toast.makeText(this, "AI Settings Saved", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun toggleProvider() {
+        val current = llmPlanner.provider
+        val next = if (current == LlmProvider.GEMINI) LlmProvider.OPENAI else LlmProvider.GEMINI
+        llmPlanner.provider = next
+        providerToggleBtn.text = "Provider: ${next.displayName}"
+        modelInput.setText(next.defaultModel)
+        llmPlanner.model = next.defaultModel
+        updateKeyStatusText()
+    }
+
+    private fun updateKeyStatusText() {
+        val hasKey = !llmPlanner.apiKey.isNullOrBlank()
+        if (hasKey) {
+            keyStatusText.text = "✔ Online AI Active: ${llmPlanner.provider.displayName} (${llmPlanner.model})"
+            keyStatusText.setTextColor(Color.parseColor("#81C784"))
+        } else {
+            keyStatusText.text = "⚠ Enter API Key to enable online AI planning"
+            keyStatusText.setTextColor(Color.parseColor("#FFD54F"))
+        }
+    }
+
+    private fun hideKeyboard() {
+        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+        currentFocus?.let { view ->
+            imm?.hideSoftInputFromWindow(view.windowToken, 0)
+        }
     }
 
     private fun isAccessibilityServiceEnabled(context: Context): Boolean {
@@ -336,7 +457,7 @@ class MainActivity : Activity() {
 
     private fun createLayout(): View {
         val scrollView = ScrollView(this).apply {
-            setBackgroundColor(Color.parseColor("#121212"))
+            setBackgroundColor(Color.parseColor("#0F141C"))
             isFillViewport = true
         }
 
@@ -345,121 +466,282 @@ class MainActivity : Activity() {
             setPadding(48, 64, 48, 64)
         }
 
-        // Title
+        // Branding Title
         val titleText = TextView(this).apply {
-            text = "PhonePilot"
-            textSize = 30f
+            text = "PhonePilot AI"
+            textSize = 32f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.WHITE)
         }
         container.addView(titleText)
 
-        // Subtitle
         val subtitleText = TextView(this).apply {
-            text = "Phase 4 — Autonomous Agent Loop"
-            textSize = 15f
-            setTextColor(Color.parseColor("#9E9E9E"))
-            setPadding(0, 8, 0, 36)
+            text = "Autonomous Voice & LLM Mobile Agent"
+            textSize = 14f
+            setTextColor(Color.parseColor("#90CAF9"))
+            setPadding(0, 4, 0, 28)
         }
         container.addView(subtitleText)
 
-        // Status Card
-        val statusCard = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = createRoundedDrawable(Color.parseColor("#1E1E1E"), cornerRadius = 24f)
-            setPadding(40, 40, 40, 40)
-        }
-
+        // Accessibility Service Status Badge
         statusBadge = TextView(this).apply {
-            textSize = 12f
+            textSize = 11f
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(24, 12, 24, 12)
+            setPadding(20, 10, 20, 10)
         }
-        statusCard.addView(statusBadge)
-
-        statusDescription = TextView(this).apply {
-            textSize = 14f
-            setTextColor(Color.parseColor("#CCCCCC"))
-            setPadding(0, 24, 0, 32)
-            setLineSpacing(6f, 1f)
-        }
-        statusCard.addView(statusDescription)
+        container.addView(statusBadge)
 
         settingsButton = Button(this).apply {
+            text = "Grant Accessibility Permission"
             setTextColor(Color.WHITE)
-            textSize = 14f
+            textSize = 13f
             typeface = Typeface.DEFAULT_BOLD
-            background = createRoundedDrawable(Color.parseColor("#2979FF"), cornerRadius = 16f)
-            setPadding(32, 24, 32, 24)
-            setOnClickListener { openAccessibilitySettings() }
-        }
-        statusCard.addView(settingsButton)
-
-        container.addView(statusCard)
-
-        // =========================================================================
-        // Autonomous Agent Loop Console Card (PHASE 4)
-        // =========================================================================
-        val agentCard = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = createRoundedDrawable(Color.parseColor("#1A2138"), cornerRadius = 24f)
-            setPadding(40, 40, 40, 40)
+            background = createRoundedDrawable(Color.parseColor("#FF9100"), cornerRadius = 14f)
             val params = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply {
-                topMargin = 32
+                topMargin = 12
+            }
+            layoutParams = params
+            setPadding(24, 16, 24, 16)
+            setOnClickListener { openAccessibilitySettings() }
+            visibility = View.GONE
+        }
+        container.addView(settingsButton)
+
+        // =========================================================================
+        // AI Model & Key Configuration Card
+        // =========================================================================
+        val configCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = createRoundedDrawable(Color.parseColor("#171F2C"), cornerRadius = 24f)
+            setPadding(36, 36, 36, 36)
+            val params = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = 28
+            }
+            layoutParams = params
+        }
+
+        val configTitle = TextView(this).apply {
+            text = "AI Model Configuration"
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+        }
+        configCard.addView(configTitle)
+
+        providerToggleBtn = Button(this).apply {
+            text = "Provider: ${llmPlanner.provider.displayName}"
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+            background = createRoundedDrawable(Color.parseColor("#26354A"), cornerRadius = 12f)
+            val params = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = 14
+            }
+            layoutParams = params
+            setPadding(20, 14, 20, 14)
+            setOnClickListener { toggleProvider() }
+        }
+        configCard.addView(providerToggleBtn)
+
+        modelInput = EditText(this).apply {
+            hint = "Model Name"
+            setText(llmPlanner.model)
+            setHintTextColor(Color.parseColor("#78909C"))
+            setTextColor(Color.WHITE)
+            textSize = 13f
+            background = createRoundedDrawable(Color.parseColor("#121924"), cornerRadius = 12f)
+            setPadding(20, 16, 20, 16)
+            val params = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = 10
+            }
+            layoutParams = params
+        }
+        configCard.addView(modelInput)
+
+        apiKeyInput = EditText(this).apply {
+            hint = "API Key"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            setText(prefs.getString(KEY_API_KEY, ""))
+            setHintTextColor(Color.parseColor("#78909C"))
+            setTextColor(Color.WHITE)
+            textSize = 13f
+            background = createRoundedDrawable(Color.parseColor("#121924"), cornerRadius = 12f)
+            setPadding(20, 16, 20, 16)
+            val params = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = 10
+            }
+            layoutParams = params
+        }
+        configCard.addView(apiKeyInput)
+
+        saveKeyBtn = Button(this).apply {
+            text = "Save Configuration"
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+            background = createRoundedDrawable(Color.parseColor("#00B0FF"), cornerRadius = 12f)
+            val params = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = 12
+            }
+            layoutParams = params
+            setPadding(20, 14, 20, 14)
+            setOnClickListener { saveApiConfig() }
+        }
+        configCard.addView(saveKeyBtn)
+
+        keyStatusText = TextView(this).apply {
+            textSize = 12f
+            setPadding(0, 10, 0, 0)
+        }
+        updateKeyStatusText()
+        configCard.addView(keyStatusText)
+
+        container.addView(configCard)
+
+        // =========================================================================
+        // Autonomous Agent Voice & Goal Console
+        // =========================================================================
+        val agentCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = createRoundedDrawable(Color.parseColor("#171F2C"), cornerRadius = 24f)
+            setPadding(36, 36, 36, 36)
+            val params = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = 28
             }
             layoutParams = params
         }
 
         val agentTitle = TextView(this).apply {
-            text = "Autonomous Agent Console"
-            textSize = 17f
+            text = "Agent Goal & Voice Input"
+            textSize = 16f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.WHITE)
         }
         agentCard.addView(agentTitle)
 
-        val agentDesc = TextView(this).apply {
-            text = "User Goal ➔ Observe ➔ Evaluate Loop ➔ Plan Next ➔ ActionEngine ➔ Repeat"
-            textSize = 12f
-            setTextColor(Color.parseColor("#90CAF9"))
-            setPadding(0, 4, 0, 20)
-        }
-        agentCard.addView(agentDesc)
-
         // State Badge
         agentStateBadge = TextView(this).apply {
             text = "● IDLE"
-            textSize = 12f
+            textSize = 11f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.parseColor("#90A4AE"))
-            background = createRoundedDrawable(Color.parseColor("#263238"), cornerRadius = 12f)
-            setPadding(20, 10, 20, 10)
+            background = createRoundedDrawable(Color.parseColor("#26354A"), cornerRadius = 10f)
+            val params = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = 12
+            }
+            layoutParams = params
+            setPadding(16, 8, 16, 8)
         }
         agentCard.addView(agentStateBadge)
 
-        // Goal Input Field
-        agentGoalInput = EditText(this).apply {
-            hint = "e.g. 'Open Settings and tap Wi-Fi'"
-            setText("Open Settings and tap Wi-Fi")
-            setHintTextColor(Color.parseColor("#78909C"))
-            setTextColor(Color.WHITE)
-            textSize = 14f
-            background = createRoundedDrawable(Color.parseColor("#15202B"), cornerRadius = 12f)
-            setPadding(28, 24, 28, 24)
+        // Goal Input Row (Mic + EditText)
+        val inputRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
             val params = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply {
-                topMargin = 16
+                topMargin = 14
             }
             layoutParams = params
         }
-        agentCard.addView(agentGoalInput)
 
-        // Action Buttons Row: Start & Cancel
+        micButton = Button(this).apply {
+            text = "🎙 Voice"
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+            background = createRoundedDrawable(Color.parseColor("#7C4DFF"), cornerRadius = 14f)
+            val params = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.MATCH_PARENT
+            ).apply {
+                marginEnd = 10
+            }
+            layoutParams = params
+            setPadding(22, 18, 22, 18)
+            setOnClickListener { startVoiceListening() }
+        }
+        inputRow.addView(micButton)
+
+        agentGoalInput = EditText(this).apply {
+            hint = "Speak or enter goal (e.g. 'Turn on Wi-Fi')"
+            setHintTextColor(Color.parseColor("#78909C"))
+            setTextColor(Color.WHITE)
+            textSize = 14f
+            background = createRoundedDrawable(Color.parseColor("#121924"), cornerRadius = 14f)
+            setPadding(22, 18, 22, 18)
+            val params = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0f)
+            layoutParams = params
+        }
+        inputRow.addView(agentGoalInput)
+        agentCard.addView(inputRow)
+
+        // Audio TTS Feedback Toggle
+        ttsCheckbox = CheckBox(this).apply {
+            text = "🔊 Voice Feedback (Announce actions aloud)"
+            isChecked = prefs.getBoolean(KEY_TTS_ENABLED, true)
+            setTextColor(Color.parseColor("#B0BEC5"))
+            textSize = 12f
+            val params = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = 12
+            }
+            layoutParams = params
+            setOnCheckedChangeListener { _, isChecked ->
+                prefs.edit().putBoolean(KEY_TTS_ENABLED, isChecked).apply()
+                voiceManager.isTtsEnabled = isChecked
+            }
+        }
+        agentCard.addView(ttsCheckbox)
+
+        // Floating Bubble Assistant Overlay Toggle
+        handsFreeCheckbox = CheckBox(this).apply {
+            text = "🛸 Floating Bubble Overlay (Tap: 1-Shot, Hold: Always-On Mic)"
+            isChecked = com.phonepilot.service.PilotService.isRunning || prefs.getBoolean(KEY_HANDS_FREE_ENABLED, false)
+            setTextColor(Color.parseColor("#38BDF8"))
+            textSize = 12f
+            typeface = Typeface.DEFAULT_BOLD
+            val params = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = 8
+            }
+            layoutParams = params
+            setOnClickListener {
+                toggleHandsFree(isChecked)
+            }
+        }
+        agentCard.addView(handsFreeCheckbox)
+
+        // Start & Cancel Action Buttons Row
         val agentButtonsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             val params = LinearLayout.LayoutParams(
@@ -472,7 +754,7 @@ class MainActivity : Activity() {
         }
 
         startAgentButton = Button(this).apply {
-            text = "▶ Start Agent Task"
+            text = "▶ Start Agent"
             textSize = 14f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.WHITE)
@@ -481,7 +763,7 @@ class MainActivity : Activity() {
                 marginEnd = 8
             }
             layoutParams = params
-            setPadding(20, 20, 20, 20)
+            setPadding(18, 18, 18, 18)
             setOnClickListener {
                 startAgentTask(agentGoalInput.text.toString())
             }
@@ -489,7 +771,7 @@ class MainActivity : Activity() {
         agentButtonsRow.addView(startAgentButton)
 
         cancelAgentButton = Button(this).apply {
-            text = "⏹ Cancel Task"
+            text = "⏹ Cancel"
             textSize = 14f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.WHITE)
@@ -498,7 +780,7 @@ class MainActivity : Activity() {
                 marginStart = 8
             }
             layoutParams = params
-            setPadding(20, 20, 20, 20)
+            setPadding(18, 18, 18, 18)
             isEnabled = false
             alpha = 0.5f
             setOnClickListener {
@@ -508,55 +790,21 @@ class MainActivity : Activity() {
         agentButtonsRow.addView(cancelAgentButton)
         agentCard.addView(agentButtonsRow)
 
-        // Preset Task Chips
-        val presetTasksContainer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(0, 16, 0, 0)
-        }
-
-        fun addAgentChip(goalText: String) {
-            val chip = Button(this).apply {
-                text = "⚡ Goal: \"$goalText\""
-                textSize = 12f
-                setTextColor(Color.parseColor("#B388FF"))
-                background = createRoundedDrawable(Color.parseColor("#311B92"), cornerRadius = 10f)
-                val params = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
-                ).apply {
-                    topMargin = 8
-                }
-                layoutParams = params
-                setPadding(16, 12, 16, 12)
-                setOnClickListener {
-                    agentGoalInput.setText(goalText)
-                    startAgentTask(goalText)
-                }
-            }
-            presetTasksContainer.addView(chip)
-        }
-
-        addAgentChip("Open Settings and tap Wi-Fi")
-        addAgentChip("Open Settings and scroll down")
-        addAgentChip("Open Settings and go back")
-        addAgentChip("Open PhonePilot")
-        agentCard.addView(presetTasksContainer)
-
-        // Agent Status Message View
+        // Live Status & LLM Reasoning View
         agentStatusView = TextView(this).apply {
             text = "Ready to start autonomous agent loop"
             textSize = 12f
             typeface = Typeface.MONOSPACE
             setTextColor(Color.parseColor("#90A4AE"))
-            background = createRoundedDrawable(Color.parseColor("#15202B"), cornerRadius = 12f)
+            background = createRoundedDrawable(Color.parseColor("#121924"), cornerRadius = 12f)
             val params = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply {
-                topMargin = 20
+                topMargin = 18
             }
             layoutParams = params
-            setPadding(24, 20, 24, 20)
+            setPadding(20, 16, 20, 16)
         }
         agentCard.addView(agentStatusView)
 
@@ -566,7 +814,7 @@ class MainActivity : Activity() {
             textSize = 12f
             typeface = Typeface.MONOSPACE
             setTextColor(Color.parseColor("#B0BEC5"))
-            background = createRoundedDrawable(Color.parseColor("#15202B"), cornerRadius = 12f)
+            background = createRoundedDrawable(Color.parseColor("#121924"), cornerRadius = 12f)
             val params = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
@@ -574,302 +822,11 @@ class MainActivity : Activity() {
                 topMargin = 12
             }
             layoutParams = params
-            setPadding(24, 20, 24, 20)
+            setPadding(20, 16, 20, 16)
         }
         agentCard.addView(agentHistoryView)
 
         container.addView(agentCard)
-
-        // AI Command Console Card (PHASE 3.1)
-        val aiCard = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = createRoundedDrawable(Color.parseColor("#1E1E1E"), cornerRadius = 24f)
-            setPadding(40, 40, 40, 40)
-            val params = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                topMargin = 32
-            }
-            layoutParams = params
-        }
-
-        val aiTitle = TextView(this).apply {
-            text = "Single-Command AI Console (Phase 3.1)"
-            textSize = 16f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(Color.WHITE)
-        }
-        aiCard.addView(aiTitle)
-
-        val aiDesc = TextView(this).apply {
-            text = "Single-turn instruction ➔ AiCommandParser ➔ ActionEngine"
-            textSize = 12f
-            setTextColor(Color.parseColor("#9E9E9E"))
-            setPadding(0, 4, 0, 20)
-        }
-        aiCard.addView(aiDesc)
-
-        commandInput = EditText(this).apply {
-            hint = "e.g. 'open settings', 'tap wi-fi', 'go back'"
-            setHintTextColor(Color.parseColor("#78909C"))
-            setTextColor(Color.WHITE)
-            textSize = 14f
-            background = createRoundedDrawable(Color.parseColor("#263238"), cornerRadius = 12f)
-            setPadding(28, 24, 28, 24)
-        }
-        aiCard.addView(commandInput)
-
-        val executeButton = Button(this).apply {
-            text = "Parse & Execute Single Command"
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(Color.WHITE)
-            background = createRoundedDrawable(Color.parseColor("#00B0FF"), cornerRadius = 14f)
-            val params = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                topMargin = 16
-            }
-            layoutParams = params
-            setPadding(24, 20, 24, 20)
-            setOnClickListener {
-                runAiCommand(commandInput.text.toString())
-            }
-        }
-        aiCard.addView(executeButton)
-
-        val chipsContainer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(0, 16, 0, 0)
-        }
-
-        fun addChipButton(commandText: String) {
-            val chip = Button(this).apply {
-                text = "⚡ \"$commandText\""
-                textSize = 12f
-                setTextColor(Color.parseColor("#80D8FF"))
-                background = createRoundedDrawable(Color.parseColor("#1A237E"), cornerRadius = 10f)
-                val params = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
-                ).apply {
-                    topMargin = 8
-                }
-                layoutParams = params
-                setPadding(16, 12, 16, 12)
-                setOnClickListener {
-                    commandInput.setText(commandText)
-                    runAiCommand(commandText)
-                }
-            }
-            chipsContainer.addView(chip)
-        }
-
-        addChipButton("open settings")
-        addChipButton("tap wi-fi")
-        addChipButton("go back")
-        addChipButton("scroll down")
-        aiCard.addView(chipsContainer)
-
-        aiResultView = TextView(this).apply {
-            text = "Ready for single command instruction"
-            textSize = 12f
-            typeface = Typeface.MONOSPACE
-            setTextColor(Color.parseColor("#90A4AE"))
-            background = createRoundedDrawable(Color.parseColor("#263238"), cornerRadius = 12f)
-            val params = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                topMargin = 20
-            }
-            layoutParams = params
-            setPadding(24, 20, 24, 20)
-        }
-        aiCard.addView(aiResultView)
-
-        container.addView(aiCard)
-
-        // Live observation Card
-        liveInfoContainer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = createRoundedDrawable(Color.parseColor("#1E1E1E"), cornerRadius = 24f)
-            setPadding(40, 40, 40, 40)
-            val params = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                topMargin = 32
-            }
-            layoutParams = params
-            visibility = View.GONE
-        }
-
-        val liveTitle = TextView(this).apply {
-            text = "Live Screen Observation"
-            textSize = 16f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(Color.WHITE)
-        }
-        liveInfoContainer.addView(liveTitle)
-
-        livePackageText = TextView(this).apply {
-            textSize = 14f
-            setTextColor(Color.parseColor("#80D8FF"))
-            setPadding(0, 16, 0, 8)
-        }
-        liveInfoContainer.addView(livePackageText)
-
-        liveElementsText = TextView(this).apply {
-            textSize = 13f
-            setTextColor(Color.parseColor("#B0BEC5"))
-            setPadding(0, 0, 0, 16)
-        }
-        liveInfoContainer.addView(liveElementsText)
-
-        liveDetailsText = TextView(this).apply {
-            textSize = 12f
-            typeface = Typeface.MONOSPACE
-            setTextColor(Color.parseColor("#78909C"))
-            setLineSpacing(4f, 1f)
-        }
-        liveInfoContainer.addView(liveDetailsText)
-
-        container.addView(liveInfoContainer)
-
-        // Action Engine Console Card (Phase 2)
-        val consoleCard = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = createRoundedDrawable(Color.parseColor("#1E1E1E"), cornerRadius = 24f)
-            setPadding(40, 40, 40, 40)
-            val params = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                topMargin = 32
-            }
-            layoutParams = params
-        }
-
-        val consoleTitle = TextView(this).apply {
-            text = "Action Engine Console (Direct)"
-            textSize = 16f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(Color.WHITE)
-        }
-        consoleCard.addView(consoleTitle)
-
-        val consoleDesc = TextView(this).apply {
-            text = "Deterministic Action Schema → Validate → Resolve → Execute"
-            textSize = 12f
-            setTextColor(Color.parseColor("#9E9E9E"))
-            setPadding(0, 4, 0, 20)
-        }
-        consoleCard.addView(consoleDesc)
-
-        actionResultView = TextView(this).apply {
-            text = "Ready to test actions"
-            textSize = 12f
-            typeface = Typeface.MONOSPACE
-            setTextColor(Color.parseColor("#90A4AE"))
-            background = createRoundedDrawable(Color.parseColor("#263238"), cornerRadius = 12f)
-            setPadding(24, 20, 24, 20)
-        }
-        consoleCard.addView(actionResultView)
-
-        val buttonsContainer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(0, 24, 0, 0)
-        }
-
-        fun addTestButton(label: String, actionBlock: () -> ActionResult) {
-            val btn = Button(this).apply {
-                text = label
-                textSize = 13f
-                setTextColor(Color.WHITE)
-                background = createRoundedDrawable(Color.parseColor("#37474F"), cornerRadius = 12f)
-                val params = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
-                ).apply {
-                    topMargin = 12
-                }
-                layoutParams = params
-                setPadding(20, 16, 20, 16)
-                setOnClickListener {
-                    runAction(label, actionBlock)
-                }
-            }
-            buttonsContainer.addView(btn)
-        }
-
-        addTestButton("Test: Read Screen") {
-            actionEngine.execute(PhonePilotAction.ReadScreen)
-        }
-
-        addTestButton("Test: Open Settings") {
-            actionEngine.execute(PhonePilotAction.OpenApp("com.android.settings"))
-        }
-
-        addTestButton("Test: Open Settings & Tap 'Wi-Fi'") {
-            val openRes = actionEngine.execute(PhonePilotAction.OpenApp("com.android.settings"))
-            if (openRes is ActionResult.Failure) return@addTestButton openRes
-
-            actionEngine.execute(PhonePilotAction.Wait(1200L))
-
-            actionEngine.execute(
-                PhonePilotAction.Tap(ElementTarget.Text("Wi-Fi", exactMatch = true))
-            )
-        }
-
-        addTestButton("Test: Find 'Action Engine Console' (On Screen)") {
-            actionEngine.execute(
-                PhonePilotAction.FindElement(ElementTarget.Text("Action Engine Console", exactMatch = true))
-            )
-        }
-
-        addTestButton("Test: Back") {
-            actionEngine.execute(PhonePilotAction.Back)
-        }
-
-        addTestButton("Test: Scroll Forward") {
-            actionEngine.execute(PhonePilotAction.Scroll(ScrollDirection.FORWARD))
-        }
-
-        addTestButton("Test: Wait (1000ms)") {
-            actionEngine.execute(PhonePilotAction.Wait(1000L))
-        }
-
-        addTestButton("Test: Ambiguous Target (query 'e')") {
-            actionEngine.execute(
-                PhonePilotAction.FindElement(ElementTarget.Text("e", exactMatch = false))
-            )
-        }
-
-        addTestButton("Test: Password Rejection (Mock UiElement)") {
-            val mockPasswordNode = UiElement(
-                id = "mock.auth:id/password_input",
-                className = "android.widget.EditText",
-                isPassword = true,
-                isEditable = true,
-                isVisible = true
-            )
-            val validation = actionEngine.validator.validateElementForTyping(mockPasswordNode)
-            if (validation is ValidationResult.Invalid) {
-                ActionResult.Failure("Type", validation.reason, recoverable = validation.recoverable)
-            } else {
-                ActionResult.Success("Type", "Password field accepted (security rule failed!)")
-            }
-        }
-
-        addTestButton("Test: Invalid Action (Empty Pkg)") {
-            actionEngine.execute(PhonePilotAction.OpenApp(""))
-        }
-
-        consoleCard.addView(buttonsContainer)
-        container.addView(consoleCard)
 
         scrollView.addView(container)
         return scrollView

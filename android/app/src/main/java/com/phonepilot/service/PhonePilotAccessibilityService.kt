@@ -52,6 +52,11 @@ class PhonePilotAccessibilityService : AccessibilityService() {
          */
         val instance: PhonePilotAccessibilityService?
             get() = serviceRef?.get()
+
+        /**
+         * Callback for double-pressing volume down button hardware trigger.
+         */
+        var onHardwareVoiceTrigger: (() -> Unit)? = null
     }
 
     private var lastObservedPackage: String? = null
@@ -143,5 +148,21 @@ class PhonePilotAccessibilityService : AccessibilityService() {
         Log.i(TAG, "UI changed ($reason): package=$currentPkg, interactive=$interactiveCount, readable=$readableCount")
 
         return snapshot
+    }
+
+    private var lastVolumeDownTime = 0L
+
+    override fun onKeyEvent(event: android.view.KeyEvent): Boolean {
+        if (event.keyCode == android.view.KeyEvent.KEYCODE_VOLUME_DOWN && event.action == android.view.KeyEvent.ACTION_DOWN) {
+            val now = System.currentTimeMillis()
+            if (now - lastVolumeDownTime < 450) {
+                Log.i(TAG, "Hardware Trigger: Double-pressed Volume Down! Triggering voice capture...")
+                onHardwareVoiceTrigger?.invoke()
+                lastVolumeDownTime = 0L
+                return true
+            }
+            lastVolumeDownTime = now
+        }
+        return super.onKeyEvent(event)
     }
 }
